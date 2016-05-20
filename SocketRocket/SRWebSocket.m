@@ -236,6 +236,7 @@ typedef void (^data_callback)(SRWebSocket *webSocket,  NSData *data);
 
     BOOL _sentClose;
     BOOL _didFail;
+    BOOL _cleanupScheduled;
     int _closeCode;
     
     BOOL _isPumping;
@@ -753,11 +754,11 @@ static __strong NSData *CRLFCRLF;
             }];
 
             self.readyState = SR_CLOSED;
-            _selfRetain = nil;
 
             SRFastLog(@"Failing with error %@", error.localizedDescription);
             
             [self closeConnection];
+            [self _scheduleCleanup];
         }
     });
 }
@@ -1165,13 +1166,15 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
          _inputStream.streamStatus != NSStreamStatusClosed) &&
         !_sentClose) {
         _sentClose = YES;
-            
-        [_outputStream close];
-        [_inputStream close];
-        
-        
-        for (NSArray *runLoop in [_scheduledRunloops copy]) {
-            [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
+
+        @synchronized(self) {
+            [_outputStream close];
+            [_inputStream close];
+
+
+            for (NSArray *runLoop in [_scheduledRunloops copy]) {
+                [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
+            }
         }
         
         if (!_failed) {
@@ -1182,7 +1185,7 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
             }];
         }
         
-        _selfRetain = nil;
+        [self _scheduleCleanup];
     }
 }
 
@@ -1206,6 +1209,42 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
     [self assertOnWorkQueue];
     [_consumers addObject:[_consumerPool consumerWithScanner:consumer handler:callback bytesNeeded:dataLength readToCurrentFrame:NO unmaskBytes:NO]];
     [self _pumpScanner];
+}
+
+- (void)_scheduleCleanup
+{
+    @synchronized(self) {
+        if (_cleanupScheduled) {
+            return;
+        }
+        
+        _cleanupScheduled = YES;
+        
+        // Cleanup NSStream delegate's in the same RunLoop used by the streams themselves:
+        // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
+        NSTimer *timer = [NSTimer timerWithTimeInterval:0.f target:self
+			selector:@selector(_cleanupSelfReference) userInfo:nil repeats:NO];
+        
+        [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+    }
+}
+
+- (void)_cleanupSelfReference
+{
+    @synchronized(self) {
+        // Remove the delegates for each stream so we don't fire any events on close or error
+        _inputStream.delegate = nil;
+        _outputStream.delegate = nil;
+        
+        // Close the streams, which will immediately remove them from the run loop.
+        [_inputStream close];
+        [_outputStream close];
+    }
+    
+    // Cleanup self reference in the same GCD queue as usual
+    dispatch_async(_workQueue, ^{
+        _selfRetain = nil;
+    });
 }
 
 
@@ -1524,7 +1563,7 @@ static const size_t SRFrameHeaderOverhead = 32;
                     dispatch_async(_workQueue, ^{
                         if (self.readyState != SR_CLOSED) {
                             self.readyState = SR_CLOSED;
-                            _selfRetain = nil;
+                            [self _scheduleCleanup];
                         }
 
                         if (!_sentClose && !_failed) {
